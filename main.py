@@ -1,12 +1,48 @@
 import json
-from sqlalchemy import create_engine
-from sqlalchemy.orm import scoped_session, sessionmaker
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import scoped_session, sessionmaker, Session
 from baratheon.utils.logs import logger
 import baratheon.settings as settings
 
 from stark.models.product import Product, ProductSchema
 
 import falcon
+from gevent import monkey
+monkey.patch_all()
+
+from dogpile.cache import make_region
+from threading import Thread
+
+
+''' Cache region for dogpile.cache '''
+cache = make_region(
+    key_mangler=lambda key: "baratheon:dogpile:" + key
+).configure(
+    'dogpile.cache.redis',
+    arguments={
+        'host': '127.0.0.1',
+        'port': 6379,
+        'db': 0,
+        'redis_expiration_time': 60*60*2,  # 2 hours
+        'distributed_lock': True
+    },
+)
+
+
+def cache_refresh(session, refresher, *args, **kwargs):
+    '''
+    Refresh the functions cache data in a new thread. Starts
+    refreshing only after the session was committed so all
+    database data is available.
+    '''
+    assert isinstance(session, Session), \
+        'Need a session, not a sessionmaker or scoped_session'
+
+    @event.listens_for(session, 'after_commit')
+    def do_refresh(session):
+        t = Thread(target=refresher, args=args, kwargs=kwargs)
+        t.daemon = True
+        t.start()
 
 
 class RequireJSON(object):
@@ -61,6 +97,7 @@ class ProductEngine(object):
     def __init__(self, db):
         self.db = db
 
+    @cache.cache_on_arguments()
     def get_products(self):
         criteria = self.db.query(Product)
         products = criteria.all()
